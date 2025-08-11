@@ -15,6 +15,8 @@
  */
 
 #include "velox/connectors/hive/storage_adapters/s3fs/S3WriteFile.h"
+#include "velox/connectors/hive/storage_adapters/s3fs/S3FileSystem.h"
+#include <folly/synchronization/ThrottledLifoSem.h>
 #include "velox/common/base/StatsReporter.h"
 #include "velox/connectors/hive/storage_adapters/s3fs/S3Config.h"
 #include "velox/connectors/hive/storage_adapters/s3fs/S3Counters.h"
@@ -42,12 +44,13 @@ class S3WriteFile::Impl {
       Aws::S3::S3Client* client,
       memory::MemoryPool* pool,
       const std::shared_ptr<S3Config>& s3Config)
-      : client_(client), pool_(pool), minPartSize_(s3Config->minPartSize()) {
+      : client_(client), pool_(pool) {
     VELOX_CHECK_NOT_NULL(client);
     VELOX_CHECK_NOT_NULL(pool);
+    VELOX_CHECK_NOT_NULL(s3Config.get());
     getBucketAndKeyFromPath(path, bucket_, key_);
     currentPart_ = std::make_unique<dwio::common::DataBuffer<char>>(*pool_);
-    currentPart_->reserve(minPartSize_);
+    currentPart_->reserve(S3FileSystem::getPartUploadSize());
     // Check that the object doesn't exist, if it does throw an error.
     {
       Aws::S3::Model::HeadObjectRequest request;
@@ -130,7 +133,8 @@ class S3WriteFile::Impl {
   // Appends data to the end of the file.
   void append(std::string_view data) {
     VELOX_CHECK(!closed(), "File is closed");
-    if (data.size() + currentPart_->size() > minPartSize_) {
+    if (data.size() + currentPart_->size() >=
+        S3FileSystem::getPartUploadSize()) {
       if (uploadState_.partNumber == 0) {
         createMultipartUploadRequest();
       }
@@ -145,9 +149,9 @@ class S3WriteFile::Impl {
   // No-op.
   void flush() {
     VELOX_CHECK(!closed(), "File is closed");
-    /// currentPartSize must be less than minPartSize since
-    /// append() would have already flushed after reaching minPartSize.
-    VELOX_CHECK_LT(currentPart_->size(), minPartSize_);
+    /// currentPartSize must be less than kPartUploadSize since
+    /// append() would have already flushed after reaching kUploadPartSize.
+    VELOX_CHECK_LT(currentPart_->size(), S3FileSystem::getPartUploadSize());
   }
 
   // Send the buffer in a single request or complete the multipart upload.
@@ -167,6 +171,20 @@ class S3WriteFile::Impl {
 
     RECORD_METRIC_VALUE(kMetricS3StartedUploads);
     uploadPart({currentPart_->data(), currentPart_->size()}, true);
+    if (S3FileSystem::isUploadPartAsyncEnabled()) {
+      if (futures.size() > 0) {
+        folly::collectAll(std::move(futures)).get();
+      }
+      // The list of parts should be in ascending order.
+      std::sort(
+          uploadState_.completedParts.begin(),
+          uploadState_.completedParts.end(),
+          [](const Aws::S3::Model::CompletedPart& a,
+             const Aws::S3::Model::CompletedPart& b) {
+            return a.GetPartNumber() < b.GetPartNumber();
+          });
+    }
+
     VELOX_CHECK_EQ(uploadState_.partNumber, uploadState_.completedParts.size());
     // Complete the multipart upload.
     {
@@ -214,9 +232,13 @@ class S3WriteFile::Impl {
     Aws::String id;
   };
   UploadState uploadState_;
+  std::mutex uploadStateMutex_;
+  std::vector<folly::Future<folly::Unit>> futures;
+  folly::ThrottledLifoSem semaphore{
+    static_cast<uint32_t>(S3FileSystem::getWriteFileSemaphoreNum())};
 
-  // Data can be smaller or larger than the minPartSize_.
-  // Complete the currentPart_ and upload minPartSize_ chunks of data.
+  // Data can be smaller or larger than the part upload size.
+  // Complete the currentPart_ and upload part upload size chunks of data.
   // Save the remaining into currentPart_.
   void upload(const std::string_view data) {
     auto dataPtr = data.data();
@@ -227,18 +249,27 @@ class S3WriteFile::Impl {
     uploadPart({currentPart_->data(), currentPart_->size()});
     dataPtr += remainingBufferSize;
     dataSize -= remainingBufferSize;
-    while (dataSize > minPartSize_) {
-      uploadPart({dataPtr, minPartSize_});
-      dataPtr += minPartSize_;
-      dataSize -= minPartSize_;
+    while (dataSize > S3FileSystem::getPartUploadSize()) {
+      uploadPart({dataPtr, S3FileSystem::getPartUploadSize()});
+      dataPtr += S3FileSystem::getPartUploadSize();
+      dataSize -= S3FileSystem::getPartUploadSize();
     }
     // Stash the remaining at the beginning of currentPart.
     currentPart_->unsafeAppend(0, dataPtr, dataSize);
   }
 
   void uploadPart(const std::string_view part, bool isLast = false) {
-    // Only the last part can be less than minPartSize.
-    VELOX_CHECK(isLast || (!isLast && (part.size() == minPartSize_)));
+    if (S3FileSystem::isUploadPartAsyncEnabled()) {
+      uploadPartAsync(part, isLast);
+    } else {
+      uploadPartV1(part, isLast);
+    }
+  }
+
+  void uploadPartV1(const std::string_view part, bool isLast = false) {
+    // Only the last part can be less than kPartUploadSize.
+    VELOX_CHECK(
+        isLast || (!isLast && (part.size() == S3FileSystem::getPartUploadSize())));
     // Upload the part.
     {
       Aws::S3::Model::UploadPartRequest request;
@@ -266,6 +297,76 @@ class S3WriteFile::Impl {
       uploadState_.completedParts.push_back(std::move(part));
     }
   }
+  void uploadPartAsync(const std::string_view part, const bool isLast = false) {
+    VELOX_CHECK(
+        isLast ||
+        (!isLast && (part.size() == S3FileSystem::getPartUploadSize())));
+    LOG(INFO) << "uploadPartAsync semaphore is " << semaphore.valueGuess();
+    auto const startTime0 = std::chrono::high_resolution_clock::now();
+    semaphore.wait();
+    const int64_t partNumber = ++uploadState_.partNumber;
+    auto duration0 = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::high_resolution_clock::now() - startTime0)
+                         .count();
+    LOG(INFO) << "LOG_Part " << partNumber << " semaphore in " << duration0
+              << " ms.";
+    auto const startTime1 = std::chrono::high_resolution_clock::now();
+    auto const partLength = part.size();
+
+    std::shared_ptr<std::string> partStr =
+        std::make_shared<std::string>(part.data(), part.size());
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::high_resolution_clock::now() - startTime1)
+                        .count();
+    LOG(INFO) << "LOG_Part " << partNumber << " partCopy in " << duration
+              << " ms.";
+    futures.emplace_back(
+        folly::via(
+            S3FileSystem::getUploadThreadPool().get(),
+            [this, partNumber, partStr, partLength, startTime1]() {
+              SCOPE_EXIT {
+                semaphore.post();
+              };
+              try {
+                Aws::S3::Model::UploadPartRequest request;
+                request.SetBucket(bucket_);
+                request.SetKey(key_);
+                request.SetUploadId(uploadState_.id);
+                request.SetPartNumber(partNumber);
+                request.SetContentLength(partLength);
+
+                request.SetBody(std::make_shared<StringViewStream>(
+                    partStr->c_str(), partLength));
+
+                auto outcome = client_->UploadPart(request);
+                VELOX_CHECK_AWS_OUTCOME(
+                    outcome, "Failed to upload", bucket_, key_);
+
+                auto result = outcome.GetResult();
+                Aws::S3::Model::CompletedPart completedPart;
+                completedPart.SetPartNumber(partNumber);
+                completedPart.SetETag(result.GetETag());
+
+                // Use a mutex to ensure thread safety for completedParts update
+                {
+                  std::lock_guard<std::mutex> lock(uploadStateMutex_);
+                  uploadState_.completedParts.push_back(
+                      std::move(completedPart));
+                }
+                auto duration =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::high_resolution_clock::now() - startTime1)
+                        .count();
+
+                LOG(INFO) << "LOG_Part " << partNumber << " uploaded in "
+                          << duration << " ms.";
+              } catch (const std::exception& e) {
+                LOG(ERROR) << "Exception during async upload: " << e.what();
+              } catch (...) {
+                LOG(ERROR) << "Unknown exception during async upload.";
+              }
+            }));
+  }
 
   Aws::S3::S3Client* client_;
   memory::MemoryPool* pool_;
@@ -273,7 +374,6 @@ class S3WriteFile::Impl {
   std::string bucket_;
   std::string key_;
   size_t fileSize_ = -1;
-  const size_t minPartSize_;
 };
 
 S3WriteFile::S3WriteFile(
