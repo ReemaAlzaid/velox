@@ -15,11 +15,11 @@
  */
 
 #include "velox/connectors/hive/storage_adapters/s3fs/S3WriteFile.h"
-#include "velox/connectors/hive/storage_adapters/s3fs/S3FileSystem.h"
 #include <folly/synchronization/ThrottledLifoSem.h>
 #include "velox/common/base/StatsReporter.h"
 #include "velox/connectors/hive/storage_adapters/s3fs/S3Config.h"
 #include "velox/connectors/hive/storage_adapters/s3fs/S3Counters.h"
+#include "velox/connectors/hive/storage_adapters/s3fs/S3FileSystem.h"
 #include "velox/connectors/hive/storage_adapters/s3fs/S3Util.h"
 #include "velox/dwio/common/DataBuffer.h"
 
@@ -235,7 +235,7 @@ class S3WriteFile::Impl {
   std::mutex uploadStateMutex_;
   std::vector<folly::Future<folly::Unit>> futures;
   folly::ThrottledLifoSem semaphore{
-    static_cast<uint32_t>(S3FileSystem::getWriteFileSemaphoreNum())};
+      static_cast<uint32_t>(S3FileSystem::getWriteFileSemaphoreNum())};
 
   // Data can be smaller or larger than the part upload size.
   // Complete the currentPart_ and upload part upload size chunks of data.
@@ -260,7 +260,13 @@ class S3WriteFile::Impl {
 
   void uploadPart(const std::string_view part, bool isLast = false) {
     if (S3FileSystem::isUploadPartAsyncEnabled()) {
-      uploadPartAsync(part, isLast);
+      // If this is the last part and no parts have been uploaded yet,
+      // use the synchronous upload method.
+      if (isLast && uploadState_.partNumber == 0) {
+        uploadPartV1(part, isLast);
+      } else {
+        uploadPartAsync(part, isLast);
+      }
     } else {
       uploadPartV1(part, isLast);
     }
@@ -269,7 +275,8 @@ class S3WriteFile::Impl {
   void uploadPartV1(const std::string_view part, bool isLast = false) {
     // Only the last part can be less than kPartUploadSize.
     VELOX_CHECK(
-        isLast || (!isLast && (part.size() == S3FileSystem::getPartUploadSize())));
+        isLast ||
+        (!isLast && (part.size() == S3FileSystem::getPartUploadSize())));
     // Upload the part.
     {
       Aws::S3::Model::UploadPartRequest request;
@@ -301,71 +308,47 @@ class S3WriteFile::Impl {
     VELOX_CHECK(
         isLast ||
         (!isLast && (part.size() == S3FileSystem::getPartUploadSize())));
-    LOG(INFO) << "uploadPartAsync semaphore is " << semaphore.valueGuess();
-    auto const startTime0 = std::chrono::high_resolution_clock::now();
     semaphore.wait();
     const int64_t partNumber = ++uploadState_.partNumber;
-    auto duration0 = std::chrono::duration_cast<std::chrono::milliseconds>(
-                         std::chrono::high_resolution_clock::now() - startTime0)
-                         .count();
-    LOG(INFO) << "LOG_Part " << partNumber << " semaphore in " << duration0
-              << " ms.";
-    auto const startTime1 = std::chrono::high_resolution_clock::now();
     auto const partLength = part.size();
-
     std::shared_ptr<std::string> partStr =
         std::make_shared<std::string>(part.data(), part.size());
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::high_resolution_clock::now() - startTime1)
-                        .count();
-    LOG(INFO) << "LOG_Part " << partNumber << " partCopy in " << duration
-              << " ms.";
-    futures.emplace_back(
-        folly::via(
-            S3FileSystem::getUploadThreadPool().get(),
-            [this, partNumber, partStr, partLength, startTime1]() {
-              SCOPE_EXIT {
-                semaphore.post();
-              };
-              try {
-                Aws::S3::Model::UploadPartRequest request;
-                request.SetBucket(bucket_);
-                request.SetKey(key_);
-                request.SetUploadId(uploadState_.id);
-                request.SetPartNumber(partNumber);
-                request.SetContentLength(partLength);
+    futures.emplace_back(folly::via(
+        S3FileSystem::getUploadThreadPool().get(),
+        [this, partNumber, partStr, partLength]() {
+          SCOPE_EXIT {
+            semaphore.post();
+          };
+          try {
+            Aws::S3::Model::UploadPartRequest request;
+            request.SetBucket(bucket_);
+            request.SetKey(key_);
+            request.SetUploadId(uploadState_.id);
+            request.SetPartNumber(partNumber);
+            request.SetContentLength(partLength);
 
-                request.SetBody(std::make_shared<StringViewStream>(
-                    partStr->c_str(), partLength));
+            request.SetBody(std::make_shared<StringViewStream>(
+                partStr->c_str(), partLength));
 
-                auto outcome = client_->UploadPart(request);
-                VELOX_CHECK_AWS_OUTCOME(
-                    outcome, "Failed to upload", bucket_, key_);
+            auto outcome = client_->UploadPart(request);
+            VELOX_CHECK_AWS_OUTCOME(outcome, "Failed to upload", bucket_, key_);
 
-                auto result = outcome.GetResult();
-                Aws::S3::Model::CompletedPart completedPart;
-                completedPart.SetPartNumber(partNumber);
-                completedPart.SetETag(result.GetETag());
+            auto result = outcome.GetResult();
+            Aws::S3::Model::CompletedPart completedPart;
+            completedPart.SetPartNumber(partNumber);
+            completedPart.SetETag(result.GetETag());
 
-                // Use a mutex to ensure thread safety for completedParts update
-                {
-                  std::lock_guard<std::mutex> lock(uploadStateMutex_);
-                  uploadState_.completedParts.push_back(
-                      std::move(completedPart));
-                }
-                auto duration =
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::high_resolution_clock::now() - startTime1)
-                        .count();
-
-                LOG(INFO) << "LOG_Part " << partNumber << " uploaded in "
-                          << duration << " ms.";
-              } catch (const std::exception& e) {
-                LOG(ERROR) << "Exception during async upload: " << e.what();
-              } catch (...) {
-                LOG(ERROR) << "Unknown exception during async upload.";
-              }
-            }));
+            // Use a mutex to ensure thread safety for completedParts update
+            {
+              std::lock_guard<std::mutex> lock(uploadStateMutex_);
+              uploadState_.completedParts.push_back(std::move(completedPart));
+            }
+          } catch (const std::exception& e) {
+            LOG(ERROR) << "Exception during async upload: " << e.what();
+          } catch (...) {
+            LOG(ERROR) << "Unknown exception during async upload.";
+          }
+        }));
   }
 
   Aws::S3::S3Client* client_;
