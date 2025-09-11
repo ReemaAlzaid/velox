@@ -1108,6 +1108,22 @@ must be specified as raw byte counts.
        Otherwise, the file is split into multiple equal sized chunks of this part size excluding the last chunk.
        The `AWS specification <https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html> `_ limits the part size between 5MB and 5GB.
        Some S3 backend providers enforce these limits strictly.
+   * - hive.s3.upload-part-async
+     - bool
+     - false
+     - If true, enables asynchronous upload of parts for S3 multipart uploads.
+   * - hive.s3.part-upload-size
+     - integer
+     -
+     - Specifies the size (in bytes) of each part for S3 multipart uploads.
+   * - hive.s3.max-concurrent-upload-num
+     - integer
+     -
+     - Specifies the maximum number of concurrent uploads for S3 multipart uploads.
+   * - hive.s3.upload-threads
+     - integer
+     -
+     - Specifies the number of threads to use for S3 multipart uploads.
 
 Bucket Level Configuration
 """"""""""""""""""""""""""

@@ -57,7 +57,7 @@ class S3WriteFile : public WriteFile {
       std::string_view path,
       Aws::S3::S3Client* client,
       memory::MemoryPool* pool,
-      std::shared_ptr<S3UploadManager> uploadManager);
+      std::shared_ptr<AsyncUploadInfo> asyncUploadInfo);
 
   /// Appends data to the end of the file.
   /// Uploads a part on reaching part size limit.
@@ -74,11 +74,9 @@ class S3WriteFile : public WriteFile {
 
   /// Return the number of parts uploaded so far.
   int numPartsUploaded() const;
+  class Impl;
 
  protected:
-  void createMultipartUploadRequest();
-
-  class Impl;
   std::shared_ptr<Impl> impl_;
 };
 

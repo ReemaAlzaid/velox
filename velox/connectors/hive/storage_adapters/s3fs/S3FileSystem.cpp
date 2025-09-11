@@ -15,8 +15,6 @@
  */
 
 #include "velox/connectors/hive/storage_adapters/s3fs/S3FileSystem.h"
-#include <folly/executors/CPUThreadPoolExecutor.h>
-#include <folly/synchronization/ThrottledLifoSem.h>
 #include "velox/common/base/StatsReporter.h"
 #include "velox/common/config/Config.h"
 #include "velox/common/file/File.h"
@@ -229,72 +227,6 @@ void registerCredentialsProvider(
   });
 }
 
-std::shared_ptr<S3UploadManager> S3UploadManager::instance_ = nullptr;
-S3UploadManager::S3UploadManager(const S3Config& s3Config) {
-  uploadPartAsyncEnabled = s3Config.uploadPartAsync();
-  setPartUploadSize(s3Config.partUploadSize().value_or(s3Config.minPartSize()));
-  setWriteFileSemaphoreNum(
-      s3Config.writeFileSemaphoreNum().value_or(kDefaultWriteFileSemaphore));
-  setUploadThreadPool(s3Config.uploadThreads().value_or(kDefaultUploadThreads));
-}
-
-std::shared_ptr<S3UploadManager> S3UploadManager::getInstance(
-    const S3Config& s3Config) {
-#ifndef NDEBUG
-  // In debug mode, always create a new S3UploadManager instance for each
-  // s3Config.
-  instance_ = std::make_shared<S3UploadManager>(s3Config);
-#else
-  // In no debug mode, create a new instance only if it doesn't already exist.
-  if (!instance_) {
-    instance_ = std::make_shared<S3UploadManager>(s3Config);
-  }
-#endif
-  return instance_;
-}
-
-bool S3UploadManager::isUploadPartAsyncEnabled() const {
-  return uploadPartAsyncEnabled;
-}
-
-size_t S3UploadManager::getPartUploadSize() const {
-  return kPartUploadSize;
-}
-
-size_t S3UploadManager::getWriteFileSemaphoreNum() const {
-  return writeFileSemaphore;
-}
-
-std::shared_ptr<folly::CPUThreadPoolExecutor>
-S3UploadManager::getUploadThreadPool() const {
-  return uploadThreadPool_;
-}
-
-void S3UploadManager::setPartUploadSize(size_t partUploadSize) {
-  kPartUploadSize =
-      validatePositiveValue(partUploadSize, "hive.s3.part-upload-size");
-}
-
-void S3UploadManager::setWriteFileSemaphoreNum(size_t value) {
-  writeFileSemaphore =
-      validatePositiveValue(value, "hive.s3.write-file-semaphore-num");
-}
-
-void S3UploadManager::setUploadThreadPool(size_t value) {
-  auto threadPool = std::make_shared<folly::CPUThreadPoolExecutor>(
-      validatePositiveValue(value, "hive.s3.upload-threads"));
-  uploadThreadPool_ = threadPool;
-}
-
-size_t S3UploadManager::validatePositiveValue(
-    size_t value,
-    const std::string& name) {
-  VELOX_USER_CHECK(
-      value > 0,
-      fmt::format("Invalid configuration: '{}' must be greater than 0.", name));
-  return value;
-}
-
 class S3FileSystem::Impl {
  public:
   explicit Impl(std::shared_ptr<S3Config> s3Config)
@@ -369,7 +301,16 @@ class S3FileSystem::Impl {
 
     auto credentialsProvider = getCredentialsProvider(*s3Config_);
 
-    uploadManager_ = S3UploadManager::getInstance(*s3Config_);
+    asyncUploadInfo_ = std::make_shared<AsyncUploadInfo>();
+    asyncUploadInfo_->enabled = s3Config_->uploadPartAsync();
+    asyncUploadInfo_->partUploadSize =
+        s3Config_->partUploadSize().value_or(s3Config_->minPartSize());
+    if (auto maxConcurrentUploadNum = s3Config_->maxConcurrentUploadNum()) {
+      asyncUploadInfo_->maxConcurrentUploadNum = maxConcurrentUploadNum.value();
+    }
+    if (auto uploadThreads = s3Config_->uploadThreads()) {
+      asyncUploadInfo_->uploadThreads = uploadThreads.value();
+    }
     client_ = std::make_shared<Aws::S3::S3Client>(
         credentialsProvider, nullptr /* endpointProvider */, clientConfig);
     ++fileSystemCount;
@@ -509,8 +450,8 @@ class S3FileSystem::Impl {
     return client_.get();
   }
 
-  std::shared_ptr<S3UploadManager> s3UploadManager() const {
-    return uploadManager_;
+  std::shared_ptr<AsyncUploadInfo> getAsyncUploadInfo() const {
+    return asyncUploadInfo_;
   }
 
   std::string getLogLevelName() const {
@@ -528,7 +469,7 @@ class S3FileSystem::Impl {
  private:
   std::shared_ptr<Aws::S3::S3Client> client_;
   std::shared_ptr<S3Config> s3Config_;
-  std::shared_ptr<S3UploadManager> uploadManager_;
+  std::shared_ptr<AsyncUploadInfo> asyncUploadInfo_;
 };
 
 S3FileSystem::S3FileSystem(
@@ -561,7 +502,7 @@ std::unique_ptr<WriteFile> S3FileSystem::openFileForWrite(
     const FileOptions& options) {
   const auto path = getPath(s3Path);
   auto s3file = std::make_unique<S3WriteFile>(
-      path, impl_->s3Client(), options.pool, impl_->s3UploadManager());
+      path, impl_->s3Client(), options.pool, impl_->getAsyncUploadInfo());
   return s3file;
 }
 
