@@ -301,16 +301,6 @@ class S3FileSystem::Impl {
 
     auto credentialsProvider = getCredentialsProvider(*s3Config_);
 
-    asyncUploadInfo_ = std::make_shared<AsyncUploadInfo>();
-    asyncUploadInfo_->enabled = s3Config_->uploadPartAsync();
-    asyncUploadInfo_->partUploadSize =
-        s3Config_->partUploadSize().value_or(s3Config_->minPartSize());
-    if (auto maxConcurrentUploadNum = s3Config_->maxConcurrentUploadNum()) {
-      asyncUploadInfo_->maxConcurrentUploadNum = maxConcurrentUploadNum.value();
-    }
-    if (auto uploadThreads = s3Config_->uploadThreads()) {
-      asyncUploadInfo_->uploadThreads = uploadThreads.value();
-    }
     client_ = std::make_shared<Aws::S3::S3Client>(
         credentialsProvider, nullptr /* endpointProvider */, clientConfig);
     ++fileSystemCount;
@@ -450,8 +440,8 @@ class S3FileSystem::Impl {
     return client_.get();
   }
 
-  std::shared_ptr<AsyncUploadInfo> getAsyncUploadInfo() const {
-    return asyncUploadInfo_;
+  S3Config* s3Config() const {
+    return s3Config_.get();
   }
 
   std::string getLogLevelName() const {
@@ -469,7 +459,6 @@ class S3FileSystem::Impl {
  private:
   std::shared_ptr<Aws::S3::S3Client> client_;
   std::shared_ptr<S3Config> s3Config_;
-  std::shared_ptr<AsyncUploadInfo> asyncUploadInfo_;
 };
 
 S3FileSystem::S3FileSystem(
@@ -502,7 +491,7 @@ std::unique_ptr<WriteFile> S3FileSystem::openFileForWrite(
     const FileOptions& options) {
   const auto path = getPath(s3Path);
   auto s3file = std::make_unique<S3WriteFile>(
-      path, impl_->s3Client(), options.pool, impl_->getAsyncUploadInfo());
+      path, impl_->s3Client(), options.pool, impl_->s3Config());
   return s3file;
 }
 

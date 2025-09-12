@@ -1114,15 +1114,15 @@ must be specified as raw byte counts.
      - If true, enables asynchronous upload of parts for S3 multipart uploads.
    * - hive.s3.part-upload-size
      - integer
-     -
+     - 10485760
      - Specifies the size (in bytes) of each part for S3 multipart uploads.
    * - hive.s3.max-concurrent-upload-num
      - integer
-     -
+     - 4
      - Specifies the maximum number of concurrent uploads for S3 multipart uploads.
    * - hive.s3.upload-threads
      - integer
-     -
+     - 16
      - Specifies the number of threads to use for S3 multipart uploads.
 
 Bucket Level Configuration
