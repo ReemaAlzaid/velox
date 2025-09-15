@@ -78,7 +78,7 @@ class S3Config {
     kCredentialsProvider,
     kIMDSEnabled,
     kMultipartMinPartSize,
-    KUploadPartAsync,
+    KPartUploadAsync,
     kPartUploadSize,
     KMaxConcurrentUploadNum,
     KUploadThreads,
@@ -123,8 +123,8 @@ class S3Config {
             {Keys::kIMDSEnabled, std::make_pair("aws-imds-enabled", "true")},
             {Keys::kMultipartMinPartSize,
              std::make_pair("min-part-size", "10MB")},
-            {Keys::KUploadPartAsync,
-             std::make_pair("upload-part-async", "false")},
+            {Keys::KPartUploadAsync,
+             std::make_pair("part-upload-async", "false")},
             {Keys::kPartUploadSize,
              std::make_pair("part-upload-size", "10485760")},
             {Keys::KMaxConcurrentUploadNum,
@@ -267,8 +267,8 @@ class S3Config {
 
   size_t minPartSize() const;
 
-  bool uploadPartAsync() const {
-    auto value = config_.find(Keys::KUploadPartAsync)->second.value();
+  bool partUploadAsync() const {
+    auto value = config_.find(Keys::KPartUploadAsync)->second.value();
     return folly::to<bool>(value);
   }
 

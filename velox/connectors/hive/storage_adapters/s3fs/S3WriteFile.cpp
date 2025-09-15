@@ -49,7 +49,7 @@ class S3WriteFile::Impl {
     VELOX_CHECK_NOT_NULL(pool);
     VELOX_CHECK_NOT_NULL(s3Config);
     partUploadSize_ = s3Config->partUploadSize();
-    if (s3Config->uploadPartAsync()) {
+    if (s3Config->partUploadAsync()) {
       maxConcurrentUploadNum_ = std::make_unique<folly::ThrottledLifoSem>(
           s3Config->maxConcurrentUploadNum());
       if (!uploadThreadPool_) {

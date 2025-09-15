@@ -74,6 +74,8 @@ class S3WriteFile : public WriteFile {
 
   /// Return the number of parts uploaded so far.
   int numPartsUploaded() const;
+
+ protected:
   class Impl;
 
  protected:
