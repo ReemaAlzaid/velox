@@ -77,8 +77,6 @@ class S3WriteFile : public WriteFile {
 
  protected:
   class Impl;
-
- protected:
   std::shared_ptr<Impl> impl_;
 };
 
