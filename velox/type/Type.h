@@ -18,7 +18,6 @@
 #include <folly/CPortability.h>
 #include <folly/Random.h>
 #include <folly/container/F14Set.h>
-#include <folly/dynamic.h>
 
 #include <cstdint>
 #include <cstring>
@@ -44,6 +43,10 @@
 #include "velox/type/Timestamp.h"
 #include "velox/type/Tree.h"
 #include "velox/type/tz/TimeZoneMap.h"
+
+namespace folly {
+struct dynamic;
+}
 
 namespace facebook::velox {
 
@@ -823,13 +826,7 @@ class ScalarType : public CanProvideCustomComparisonType<KIND> {
     return Type::hasSameTypeId(other);
   }
 
-  // TODO: velox implementation is in cpp
-  folly::dynamic serialize() const override {
-    folly::dynamic obj = folly::dynamic::object;
-    obj["name"] = "Type";
-    obj["type"] = TypeTraits<KIND>::name;
-    return obj;
-  }
+  folly::dynamic serialize() const override;
 };
 
 /// This class represents the fixed-point numbers.
@@ -877,13 +874,7 @@ class DecimalType : public ScalarType<KIND> {
     return fmt::format("DECIMAL({}, {})", precision(), scale());
   }
 
-  folly::dynamic serialize() const override {
-    auto obj = ScalarType<KIND>::serialize();
-    obj["type"] = name();
-    obj["precision"] = precision();
-    obj["scale"] = scale();
-    return obj;
-  }
+  folly::dynamic serialize() const override;
 
   std::span<const TypeParameter> parameters() const override {
     return parameters_;
@@ -1056,12 +1047,7 @@ class UnknownType : public CanProvideCustomComparisonType<TypeKind::UNKNOWN> {
     return Type::hasSameTypeId(other);
   }
 
-  folly::dynamic serialize() const override {
-    folly::dynamic obj = folly::dynamic::object;
-    obj["name"] = "Type";
-    obj["type"] = TypeTraits<TypeKind::UNKNOWN>::name;
-    return obj;
-  }
+  folly::dynamic serialize() const override;
 };
 
 class ArrayType : public TypeBase<TypeKind::ARRAY> {
@@ -1527,16 +1513,9 @@ class IntervalDayTimeType final : public BigintType {
   /// Perhaps, Type::valueToString(variant)?
   std::string valueToString(int64_t value) const;
 
-  folly::dynamic serialize() const override {
-    folly::dynamic obj = folly::dynamic::object;
-    obj["name"] = "IntervalDayTimeType";
-    obj["type"] = name();
-    return obj;
-  }
+  folly::dynamic serialize() const override;
 
-  static TypePtr deserialize(const folly::dynamic& /*obj*/) {
-    return IntervalDayTimeType::get();
-  }
+  static TypePtr deserialize(const folly::dynamic& obj);
 };
 
 FOLLY_ALWAYS_INLINE std::shared_ptr<const IntervalDayTimeType>
@@ -1578,16 +1557,9 @@ class IntervalYearMonthType final : public IntegerType {
   /// represented as 1-2; -14 months would be represents as -1-2.
   std::string valueToString(int32_t value) const;
 
-  folly::dynamic serialize() const override {
-    folly::dynamic obj = folly::dynamic::object;
-    obj["name"] = "IntervalYearMonthType";
-    obj["type"] = name();
-    return obj;
-  }
+  folly::dynamic serialize() const override;
 
-  static TypePtr deserialize(const folly::dynamic& /*obj*/) {
-    return IntervalYearMonthType::get();
-  }
+  static TypePtr deserialize(const folly::dynamic& obj);
 };
 
 FOLLY_ALWAYS_INLINE std::shared_ptr<const IntervalYearMonthType>
@@ -1632,16 +1604,9 @@ class DateType final : public IntegerType {
 
   int32_t toDays(const char* in, size_t len) const;
 
-  folly::dynamic serialize() const override {
-    folly::dynamic obj = folly::dynamic::object;
-    obj["name"] = "DateType";
-    obj["type"] = name();
-    return obj;
-  }
+  folly::dynamic serialize() const override;
 
-  static TypePtr deserialize(const folly::dynamic& /*obj*/) {
-    return DateType::get();
-  }
+  static TypePtr deserialize(const folly::dynamic& obj);
 };
 
 FOLLY_ALWAYS_INLINE std::shared_ptr<const DateType> DATE() {
@@ -2605,95 +2570,6 @@ void toAppend(
 
 /// Appends type's SQL string to 'out'. Uses DuckDB SQL.
 void toTypeSql(const TypePtr& type, std::ostream& out);
-
-/// Cache of serialized RowType instances. Useful to reduce the size of
-/// serialized expressions and plans. Disabled by default. Not thread safe.
-///
-/// To enable, call 'serializedTypeCache().enable()'. This enables the cache for
-/// the current thread. To disable, call 'serializedTypeCache().disable()'.
-/// While enables, type serialization will use the cache and serialize the types
-/// using IDs stored in the cache. The caller is responsible for saving
-/// serialized types from the cache and using these to hidrate
-/// 'deserializedTypeCache()' before deserializing the types.
-class SerializedTypeCache {
- public:
-  struct Options {
-    // Caching applies to RowType's with at least this many fields.
-    size_t minRowTypeSize = 10;
-  };
-
-  bool isEnabled() const {
-    return enabled_;
-  }
-
-  const Options& options() const {
-    return options_;
-  }
-
-  void enable(const Options& options = {.minRowTypeSize = 10}) {
-    enabled_ = true;
-    options_ = options;
-  }
-
-  void disable() {
-    enabled_ = false;
-  }
-
-  size_t size() const {
-    return cache_.size();
-  }
-
-  void clear() {
-    cache_.clear();
-  }
-
-  /// Returns the ID of the type if it is in the cache. Returns std::nullopt if
-  /// type is not found in the cache. Cache key is type instance pointer. Hence,
-  /// equal but different instances are stored separately.
-  std::optional<int32_t> get(const Type& type) const;
-
-  /// Stores the type in the cache. Returns the ID of the type. Reports an error
-  /// if type is already present in the cache. IDs are monotonically increasing.
-  /// Serialized type may refer to types stored previously in the cache. When
-  /// deserializing type cache, make sure to deserialize types in the order of
-  /// cache IDs.
-  int32_t put(const Type& type, folly::dynamic serialized);
-
-  /// Serialized the types stored in the cache. Use
-  /// DeserializedTypeCache::deserialize to deserialize.
-  folly::dynamic serialize();
-
- private:
-  bool enabled_{false};
-  Options options_;
-  folly::F14FastMap<const Type*, std::pair<int32_t, folly::dynamic>> cache_;
-};
-
-/// Thread local cache of serialized RowType instances. Used by
-/// RowType::serialize.
-SerializedTypeCache& serializedTypeCache();
-
-/// Thread local cache of deserialized RowType instances. Used when
-/// deserializing Type objects.
-class DeserializedTypeCache {
- public:
-  void deserialize(const folly::dynamic& obj);
-
-  size_t size() const {
-    return cache_.size();
-  }
-
-  const TypePtr& get(int32_t id) const;
-
-  void clear() {
-    cache_.clear();
-  }
-
- private:
-  folly::F14FastMap<int32_t, TypePtr> cache_;
-};
-
-DeserializedTypeCache& deserializedTypeCache();
 
 template <typename T>
 std::string Type::valueToString(T value) const {
