@@ -33,6 +33,7 @@
 #include <cudf/replace.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
+#include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/unary.hpp>
 
@@ -126,6 +127,8 @@ std::unique_ptr<cudf::column> combineBoolMasks(
     cudf::column_view rhs,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) {
+  // These are BOOL8 value columns, not validity bitmasks. cudf::bitmask_or
+  // would combine null masks instead of row-wise boolean values.
   return cudf::binary_operation(
       lhs,
       rhs,
@@ -445,28 +448,32 @@ std::unique_ptr<cudf::column> makeRepeatedArrayColumn(
     rmm::device_async_resource_ref mr) {
   // CudfFunction::eval receives columns only for non literal inputs. For a
   // constant array literal like subscript(array[1, 1, 0], groupid + 1), the
-  // array side is not present in inputColumns. Repeat the single Velox array
-  // value to match the number of index rows, then reuse the normal
-  // Velox to Cudf conversion path to build a lists column.
-  const auto rowCount = static_cast<vector_size_t>(size);
-  auto repeatedArray =
-      BaseVector::create(arrayVector->type(), rowCount, arrayVector->pool());
-  if (rowCount > 0) {
-    SelectivityVector rows(rowCount);
-    std::vector<vector_size_t> sourceRows(rowCount, 0);
-    repeatedArray->copy(arrayVector.get(), rows, sourceRows.data());
-  }
-  auto row = std::make_shared<RowVector>(
+  // array side is not present in inputColumns. Convert only the single Velox
+  // array value to cuDF, then repeat it on GPU to match the number of index
+  // rows.
+  auto literalArray =
+      BaseVector::create(arrayVector->type(), 1, arrayVector->pool());
+  SelectivityVector singleRow(1);
+  std::vector<vector_size_t> sourceRows(1, 0);
+  literalArray->copy(arrayVector.get(), singleRow, sourceRows.data());
+
+  auto rowVector = std::make_shared<RowVector>(
       arrayVector->pool(),
       ROW({"literal_array"}, {arrayVector->type()}),
       BufferPtr(nullptr),
-      size,
-      std::vector<VectorPtr>{repeatedArray});
+      1,
+      std::vector<VectorPtr>{literalArray});
 
-  auto table = with_arrow::toCudfTable(row, arrayVector->pool(), stream, mr);
+  auto table =
+      with_arrow::toCudfTable(rowVector, arrayVector->pool(), stream, mr);
   auto columns = table->release();
   VELOX_CHECK_EQ(columns.size(), 1);
-  return std::move(columns[0]);
+
+  auto repeatedTable =
+      cudf::repeat(cudf::table_view{{columns[0]->view()}}, size, stream, mr);
+  auto repeatedColumns = repeatedTable->release();
+  VELOX_CHECK_EQ(repeatedColumns.size(), 1);
+  return std::move(repeatedColumns[0]);
 }
 
 // Shared array-access machinery for ARRAY index access.
@@ -490,9 +497,8 @@ class ArrayAccessFunction : public CudfFunction {
     //   subscript({1, 1, 0}, plus(groupid, 1))
     // which arises in Q70's ROLLUP bitmask projection. Cache the Velox vector
     // so we can convert it to a cuDF lists column at eval time.
-    auto constArrayExpr =
-        std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[0]);
-    if (constArrayExpr != nullptr) {
+    if (auto constArrayExpr =
+            std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[0])) {
       constantArrayVector_ = constArrayExpr->value();
     }
 
@@ -501,8 +507,8 @@ class ArrayAccessFunction : public CudfFunction {
     // Null literal indices are still literal indices, but native Velox default
     // null behavior returns null for them instead of calling the vector
     // function, so leave constantIndex_ empty and produce an all-null result.
-    auto indexExpr = std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[1]);
-    if (indexExpr != nullptr) {
+    if (auto indexExpr =
+            std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[1])) {
       indexIsLiteral_ = true;
       if (!indexExpr->value()->isNullAt(0)) {
         constantIndex_ = readConstantIntegralValue(*indexExpr);
