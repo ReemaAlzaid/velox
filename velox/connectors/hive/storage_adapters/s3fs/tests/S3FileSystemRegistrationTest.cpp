@@ -26,25 +26,25 @@ std::string cacheKeyFunc(
   return config->get<std::string>("hive.s3.endpoint").value();
 }
 
-class TestS3FileSystem : public S3FileSystem {
+class CustomS3FileSystem : public S3FileSystem {
  public:
-  TestS3FileSystem(
+  CustomS3FileSystem(
       std::string_view bucketName,
       std::shared_ptr<const config::ConfigBase> config)
       : S3FileSystem(bucketName, config) {}
 };
 
-std::shared_ptr<FileSystem> testS3FileSystemFactory(
+std::shared_ptr<FileSystem> s3FileSystemFactory(
     std::string_view bucketName,
     std::shared_ptr<const config::ConfigBase> config) {
-  return std::make_shared<TestS3FileSystem>(bucketName, config);
+  return std::make_shared<CustomS3FileSystem>(bucketName, config);
 }
 
 class S3FileSystemRegistrationTest : public S3Test {
  protected:
   static void SetUpTestCase() {
     memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
-    filesystems::registerS3FileSystem(cacheKeyFunc, testS3FileSystemFactory);
+    filesystems::registerS3FileSystem(cacheKeyFunc, s3FileSystemFactory);
   }
 
   static void TearDownTestCase() {
@@ -102,7 +102,7 @@ TEST_F(S3FileSystemRegistrationTest, cacheKey) {
 TEST_F(S3FileSystemRegistrationTest, customFileSystemFactory) {
   auto hiveConfig = minioServer_->hiveConfig();
   auto s3fs = filesystems::getFileSystem(kDummyPath, hiveConfig);
-  ASSERT_NE(std::dynamic_pointer_cast<TestS3FileSystem>(s3fs), nullptr);
+  ASSERT_NE(std::dynamic_pointer_cast<CustomS3FileSystem>(s3fs), nullptr);
 }
 
 TEST_F(S3FileSystemRegistrationTest, finalize) {
