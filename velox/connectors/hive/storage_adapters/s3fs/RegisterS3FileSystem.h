@@ -38,7 +38,7 @@ using CacheKeyFn = std::function<
     std::string(std::shared_ptr<const config::ConfigBase>, std::string_view)>;
 
 using S3FileSystemFactory = std::function<std::shared_ptr<FileSystem>(
-    std::string_view bucketName,
+    std::string bucketName,
     std::shared_ptr<const config::ConfigBase> config)>;
 
 // Register the S3 filesystem.
