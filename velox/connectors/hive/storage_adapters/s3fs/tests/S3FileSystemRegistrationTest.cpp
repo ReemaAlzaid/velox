@@ -35,7 +35,7 @@ class CustomS3FileSystem : public S3FileSystem {
 };
 
 std::shared_ptr<FileSystem> s3FileSystemFactory(
-    std::string_view bucketName,
+    std::string bucketName,
     std::shared_ptr<const config::ConfigBase> config) {
   return std::make_shared<CustomS3FileSystem>(bucketName, config);
 }
@@ -102,7 +102,8 @@ TEST_F(S3FileSystemRegistrationTest, cacheKey) {
 TEST_F(S3FileSystemRegistrationTest, customFileSystemFactory) {
   auto hiveConfig = minioServer_->hiveConfig();
   auto s3fs = filesystems::getFileSystem(kDummyPath, hiveConfig);
-  ASSERT_NE(std::dynamic_pointer_cast<CustomS3FileSystem>(s3fs), nullptr);
+  auto customS3fs = std::dynamic_pointer_cast<CustomS3FileSystem>(s3fs);
+  VELOX_CHECK_NOT_NULL(customS3fs);
 }
 
 TEST_F(S3FileSystemRegistrationTest, finalize) {

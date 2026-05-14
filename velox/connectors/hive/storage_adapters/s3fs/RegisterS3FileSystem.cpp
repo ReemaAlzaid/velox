@@ -16,6 +16,8 @@
 
 #include "velox/connectors/hive/storage_adapters/s3fs/RegisterS3FileSystem.h" // @manual
 
+#include <utility>
+
 #ifdef VELOX_ENABLE_S3
 #include "velox/common/base/StatsReporter.h"
 #include "velox/connectors/hive/storage_adapters/s3fs/S3Config.h" // @manual
@@ -88,8 +90,9 @@ std::shared_ptr<FileSystem> fileSystemGenerator(
                 properties->get<std::string>(S3Config::kS3LogLocation));
         initializeS3(logLevel, logLocation);
         auto fs = fileSystemFactory
-            ? fileSystemFactory(bucketName, properties)
+            ? fileSystemFactory(std::move(bucketName), properties)
             : std::make_shared<S3FileSystem>(bucketName, properties);
+        VELOX_CHECK_NOT_NULL(fs, "S3 file system factory returned nullptr");
         instanceMap.insert({cacheKey, fs});
         return fs;
       });
