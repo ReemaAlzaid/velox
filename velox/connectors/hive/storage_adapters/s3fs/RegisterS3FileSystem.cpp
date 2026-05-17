@@ -89,9 +89,12 @@ std::shared_ptr<FileSystem> fileSystemGenerator(
             static_cast<std::optional<std::string>>(
                 properties->get<std::string>(S3Config::kS3LogLocation));
         initializeS3(logLevel, logLocation);
-        auto fs = fileSystemFactory
-            ? fileSystemFactory(std::move(bucketName), properties)
-            : std::make_shared<S3FileSystem>(bucketName, properties);
+        std::shared_ptr<FileSystem> fs;
+        if (fileSystemFactory) {
+          fs = fileSystemFactory(std::move(bucketName), properties);
+        } else {
+          fs = std::make_shared<S3FileSystem>(bucketName, properties);
+        }
         VELOX_CHECK_NOT_NULL(fs, "S3 file system factory returned nullptr");
         instanceMap.insert({cacheKey, fs});
         return fs;
