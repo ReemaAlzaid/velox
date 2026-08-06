@@ -100,6 +100,14 @@ CudfFromVelox::CudfFromVelox(
 
 void CudfFromVelox::doAddInput(RowVectorPtr input) {
   if (input->size() > 0) {
+    // Already device-resident: pass through untouched. Reading the host
+    // children of a CudfVector would observe an empty vector, and converting
+    // via host would cost a device->host->device round trip.
+    if (std::dynamic_pointer_cast<CudfVector>(input) != nullptr) {
+      deviceInputs_.push_back(std::move(input));
+      return;
+    }
+
     // Materialize lazy vectors
     for (auto& child : input->children()) {
       child->loadedVector();
@@ -116,10 +124,23 @@ RowVectorPtr CudfFromVelox::doGetOutput() {
   const auto targetOutputSize =
       preferredGpuBatchSizeRows(operatorCtx_->driverCtx()->queryConfig());
 
-  finished_ = noMoreInput_ && inputs_.empty();
+  finished_ = noMoreInput_ && inputs_.empty() && deviceInputs_.empty();
 
-  if (finished_ or
-      (currentOutputSize_ < targetOutputSize and not noMoreInput_) or
+  if (finished_) {
+    return nullptr;
+  }
+
+  // Emit device-resident inputs as-is. Host rows that arrived before a device
+  // input are converted first to preserve arrival order.
+  if (!deviceInputs_.empty() && inputs_.empty()) {
+    auto output = std::move(deviceInputs_.front());
+    deviceInputs_.pop_front();
+    return output;
+  }
+  const bool flushForDeviceInput = !deviceInputs_.empty();
+
+  if ((currentOutputSize_ < targetOutputSize and not noMoreInput_ and
+       not flushForDeviceInput) or
       inputs_.empty()) {
     return nullptr;
   }

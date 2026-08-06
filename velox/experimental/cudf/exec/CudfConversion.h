@@ -60,6 +60,9 @@ class CudfFromVelox : public CudfOperatorBase {
  private:
   const std::optional<std::string> timestampTimeZone_;
   std::vector<RowVectorPtr> inputs_;
+  // Inputs that arrived already device-resident; emitted as-is by
+  // doGetOutput() without a host round trip.
+  std::deque<RowVectorPtr> deviceInputs_;
   std::size_t currentOutputSize_ = 0;
   bool finished_ = false;
 };
